@@ -1,0 +1,83 @@
+Security
+========
+
+.. currentmodule:: websockets
+
+Encryption
+----------
+
+In production, you should always secure WebSocket connections with TLS.
+
+Secure WebSocket connections provide confidentiality and integrity, as well as
+better reliability because they reduce the risk of interference by bad proxies.
+
+WebSocket servers are usually deployed behind a reverse proxy that terminates
+TLS. Else, you can :doc:`configure TLS <../howto/encryption>` for the server.
+
+Memory usage
+------------
+
+.. warning::
+
+    An attacker who can open an arbitrary number of connections will be able
+    to perform a denial of service by memory exhaustion. If you're concerned
+    by denial of service attacks, you must reject suspicious connections
+    before they reach websockets, typically in a reverse proxy.
+
+With the default settings, opening a connection uses 70 KiB of memory.
+
+Sending some highly compressed messages could use up to 128 MiB of memory with
+an amplification factor of 1000 between network traffic and memory usage.
+
+:meth:`~asyncio.connection.Connection.recv` buffers fragmented messages and
+reassembles them in memory. There is a limit of 4096 frames per message, which
+translates to 192 KiB of memory usage on top of the message contents.
+
+You may adjust this limit with the :envvar:`WEBSOCKETS_MAX_FRAGMENTS`
+environment variable.
+
+When a message exceeds this limit, websockets closes the connection with code
+1009 (message too big).
+
+:meth:`~asyncio.connection.Connection.recv_streaming` has no such limitation.
+
+Configuring a server to :doc:`optimize memory usage <memory>` will improve
+security in addition to improving performance.
+
+HTTP limits
+-----------
+
+In the opening handshake, websockets applies limits to the amount of data that
+it accepts in order to minimize exposure to denial of service attacks.
+
+The request or status line is limited to 8192 bytes. Each header line, including
+the name and value, is limited to 8192 bytes too. No more than 128 HTTP headers
+are allowed. When the HTTP response includes a body, it is limited to 1 MiB.
+
+You may change these limits by setting the :envvar:`WEBSOCKETS_MAX_LINE_LENGTH`,
+:envvar:`WEBSOCKETS_MAX_NUM_HEADERS`, and :envvar:`WEBSOCKETS_MAX_BODY_SIZE`
+environment variables respectively.
+
+When a handshake request exceeds one of these limits, the server replies with
+HTTP 414 URI Too Long or 431 Request Header Fields Too Large, then closes the
+connection.
+
+When a handshake response exceeds one of these limits, the client closes the
+connection and raises an exception.
+
+Identification
+--------------
+
+By default, websockets identifies itself with a ``Server`` or ``User-Agent``
+header in the format ``"Python/x.y.z websockets/X.Y"``.
+
+You can set the ``server_header`` argument of :func:`~asyncio.server.serve` or
+the ``user_agent_header`` argument of :func:`~asyncio.client.connect` to
+configure another value. Setting them to :obj:`None` removes the header.
+
+Alternatively, you can set the :envvar:`WEBSOCKETS_SERVER` and
+:envvar:`WEBSOCKETS_USER_AGENT` environment variables respectively. Setting them
+to an empty string removes the header.
+
+If both the argument and the environment variable are set, the argument takes
+precedence.

@@ -1,0 +1,9 @@
+furo
+sphinx
+sphinx-autobuild
+sphinx-copybutton
+sphinx-inline-tabs
+sphinxcontrib-spelling
+sphinxext-opengraph
+trio
+werkzeug
