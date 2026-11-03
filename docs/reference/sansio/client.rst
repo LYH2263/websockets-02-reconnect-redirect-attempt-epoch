@@ -58,3 +58,20 @@ Client (`Sans-I/O`_)
     .. autoproperty:: close_exc
 
 .. autofunction:: process_exception
+
+Reconnect / redirect attempt generations
+.........................................
+
+.. currentmodule:: websockets.reconnect_redirect_attempt_epoch
+
+.. autoclass:: AttemptEpoch
+    :members:
+    :special-members: __init__
+
+.. autoclass:: AttemptGeneration
+    :members:
+
+.. autoclass:: GenerationStale
+
+.. autoclass:: Redirect
+    :members:

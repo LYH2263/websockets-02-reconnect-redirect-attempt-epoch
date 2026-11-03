@@ -4,7 +4,6 @@ import logging
 import os
 import ssl as ssl_module
 import traceback
-import urllib.parse
 from collections.abc import AsyncIterator, Generator, Sequence
 from types import TracebackType
 from typing import Any, Callable, Literal
@@ -12,11 +11,10 @@ from typing import Any, Callable, Literal
 import trio
 
 from ..client import ClientProtocol, backoff, process_exception
-from ..datastructures import Headers, HeadersLike
+from ..datastructures import HeadersLike
 from ..exceptions import (
     InvalidProxyMessage,
     InvalidProxyStatus,
-    InvalidStatus,
     ProxyError,
     SecurityError,
 )
@@ -25,7 +23,15 @@ from ..extensions.permessage_deflate import enable_client_permessage_deflate
 from ..headers import validate_subprotocols
 from ..http11 import USER_AGENT, Response
 from ..protocol import CONNECTING, Event
-from ..proxy import Proxy, get_proxy, parse_proxy, prepare_connect_request
+from ..proxy import Proxy, parse_proxy, prepare_connect_request, resolve_proxy
+from ..reconnect_redirect_attempt_epoch import (
+    AttemptEpoch,
+    AttemptGeneration,
+    commit_redirect,
+    loop_generation_scope,
+    open_generation_scope,
+    trio_reconnect_wait,
+)
 from ..streams import StreamReader
 from ..typing import LoggerLike, Origin, PathLike, Subprotocol
 from ..uri import WebSocketURI, parse_uri
@@ -221,6 +227,11 @@ class connect:
         create_connection: Factory for the :class:`ClientConnection` managing
             the connection. Set it to a wrapper or a subclass to customize
             connection handling.
+        attempt_epoch: Optional :class:`~websockets.reconnect_redirect_attempt_epoch.AttemptEpoch`
+            binding redirect budgets and reconnect cursors to attempt
+            generations. Factories sharing an epoch advance, nest, and pop
+            generations without seeing each other's redirects or backoff
+            state. :obj:`None` preserves the historical, detached behavior.
 
     Any other keyword arguments are passed to :func:`~trio.open_tcp_stream`.
     For example, you can set ``host`` and ``port`` to connect to a different
@@ -273,6 +284,8 @@ class connect:
         logger: LoggerLike | None = None,
         # Escape hatch for advanced customization
         create_connection: type[ClientConnection] | None = None,
+        # Attempt generation (reconnect/redirect ledger); optional.
+        attempt_epoch: AttemptEpoch | None = None,
         # Other keyword arguments are passed to trio.open_tcp_stream
         **kwargs: Any,
     ) -> None:
@@ -322,17 +335,20 @@ class connect:
             close_timeout=close_timeout,
             max_queue=max_queue,
         )
+        self.attempt_epoch = attempt_epoch
+        # Current reconnect-loop and opening-handshake generations.
+        self._loop_generation: AttemptGeneration | None = None
+        self._open_generation: AttemptGeneration | None = None
 
-    async def open_tcp_stream(self) -> trio.abc.Stream:
+    async def open_tcp_stream(self, generation: AttemptGeneration) -> trio.abc.Stream:
         """Open a TCP or Unix connection to the server, possibly through a proxy."""
         kwargs = self.open_tcp_stream_kwargs.copy()
         unix = kwargs.pop("unix", False)
 
-        proxy = self.proxy
-        if unix:
-            proxy = None
-        if proxy is True:
-            proxy = get_proxy(self.ws_uri)
+        # The destination comes from the redirect cursor of the current
+        # attempt generation; direct, proxy, and Unix paths all read it.
+        ws_uri = generation.ws_uri
+        proxy = resolve_proxy(self.proxy, ws_uri, unix=unix)
 
         if unix:
             return await trio.open_unix_socket(kwargs.pop("path"))
@@ -343,7 +359,7 @@ class connect:
             if proxy_parsed.scheme[:5] == "socks":
                 return await connect_socks_proxy(
                     proxy_parsed,
-                    self.ws_uri,
+                    ws_uri,
                     # websockets is consistent with trio while python_socks is
                     # consistent across implementations.
                     local_addr=kwargs.pop("local_address", None),
@@ -356,7 +372,7 @@ class connect:
                     )
                 return await connect_http_proxy(
                     proxy_parsed,
-                    self.ws_uri,
+                    ws_uri,
                     user_agent_header=self.user_agent_header,
                     ssl=self.proxy_ssl,
                     server_hostname=self.proxy_server_hostname,
@@ -367,18 +383,22 @@ class connect:
                 raise AssertionError("parse_proxy returned unsupported proxy")
 
         else:  # proxy is None
-            kwargs.setdefault("host", self.ws_uri.host)
-            kwargs.setdefault("port", self.ws_uri.port)
+            kwargs.setdefault("host", ws_uri.host)
+            kwargs.setdefault("port", ws_uri.port)
             return await trio.open_tcp_stream(**kwargs)
 
-    async def enable_tls(self, stream: trio.abc.Stream) -> trio.abc.Stream:
+    async def enable_tls(
+        self,
+        stream: trio.abc.Stream,
+        generation: AttemptGeneration,
+    ) -> trio.abc.Stream:
         """Enable TLS on the connection."""
         if self.ssl is None:
             ssl = ssl_module.create_default_context()
         else:
             ssl = self.ssl
         if self.server_hostname is None:
-            server_hostname = self.ws_uri.host
+            server_hostname = generation.ws_uri.host
         else:
             server_hostname = self.server_hostname
         ssl_stream = trio.SSLStream(
@@ -390,19 +410,21 @@ class connect:
         await ssl_stream.do_handshake()
         return ssl_stream
 
-    async def open_connection(self, nursery: trio.Nursery) -> ClientConnection:
+    async def open_connection(
+        self, nursery: trio.Nursery, generation: AttemptGeneration
+    ) -> ClientConnection:
         """Create a WebSocket connection."""
         if self.stream is None:
-            stream = await self.open_tcp_stream()
+            stream = await self.open_tcp_stream(generation)
         else:
             stream = self.stream
 
         try:
-            if self.ws_uri.secure:
-                stream = await self.enable_tls(stream)
+            if generation.ws_uri.secure:
+                stream = await self.enable_tls(stream, generation)
 
             protocol = ClientProtocol(
-                self.ws_uri,
+                generation.ws_uri,
                 **self.protocol_kwargs,  # type: ignore
             )
 
@@ -415,7 +437,7 @@ class connect:
             )
 
             await connection.handshake(
-                self.additional_headers,
+                generation.additional_headers,
                 self.user_agent_header,
             )
 
@@ -438,107 +460,61 @@ class connect:
         """
         Determine whether a connection error is a redirect that can be followed.
 
+        The decision is committed on the current opening generation: a valid
+        redirect rewrites only that generation's URI and credential cursors.
+
         Return the new URI if it's a valid redirect. Else, return an exception.
 
         """
-        if not (
-            isinstance(exc, InvalidStatus)
-            and exc.response.status_code
-            in [
-                300,  # Multiple Choices
-                301,  # Moved Permanently
-                302,  # Found
-                303,  # See Other
-                307,  # Temporary Redirect
-                308,  # Permanent Redirect
-            ]
-            and "Location" in exc.response.headers
-        ):
-            return exc
-
-        old_ws_uri = self.ws_uri
-        new_uri = urllib.parse.urljoin(self.uri, exc.response.headers["Location"])
-        new_ws_uri = parse_uri(new_uri)
-
-        # If connect() received a stream, it is closed and cannot be reused.
-        if self.stream is not None:
-            return ValueError(
-                f"cannot follow redirect to {new_uri} with a preexisting stream"
-            )
-
-        # TLS downgrade is forbidden.
-        if old_ws_uri.secure and not new_ws_uri.secure:
-            return SecurityError(f"cannot follow redirect to non-secure URI {new_uri}")
-
-        # Apply restrictions to cross-origin redirects.
-        if (
-            old_ws_uri.secure != new_ws_uri.secure
-            or old_ws_uri.host != new_ws_uri.host
-            or old_ws_uri.port != new_ws_uri.port
-        ):
-            # Cross-origin redirects on Unix sockets don't quite make sense.
-            if self.open_tcp_stream_kwargs.get("unix", False):
-                return ValueError(
-                    f"cannot follow cross-origin redirect to {new_uri} "
-                    f"with a Unix socket"
-                )
-
-            # Cross-origin redirects when host and port are overridden are ill-defined.
-            if (
+        return commit_redirect(
+            self,
+            exc,
+            preexisting_endpoint=self.stream is not None,
+            unix=self.open_tcp_stream_kwargs.get("unix", False),
+            explicit_destination=(
                 self.open_tcp_stream_kwargs.get("host") is not None
                 or self.open_tcp_stream_kwargs.get("port") is not None
-            ):
-                return ValueError(
-                    f"cannot follow cross-origin redirect to {new_uri} "
-                    f"with an explicit host or port"
-                )
-
-            # Strip credentials to avoid leaking them to a different origin.
-            if self.additional_headers is not None:
-                self.additional_headers = Headers(
-                    (
-                        (key, value)
-                        for key, value in Headers(self.additional_headers).raw_items()
-                        if key.lower()
-                        not in ["authorization", "cookie", "proxy-authorization"]
-                    )
-                )
-
-        return new_uri
+            ),
+            endpoint_noun="stream",
+            destination_noun="host or port",
+        )
 
     async def connect(self, nursery: trio.Nursery) -> ClientConnection:
-        try:
-            with (
-                trio.CancelScope()
-                if self.open_timeout is None
-                else trio.fail_after(self.open_timeout)
-            ):
-                for _ in range(MAX_REDIRECTS):
-                    try:
-                        connection = await self.open_connection(nursery)
-                    except Exception as exc:
-                        exc_or_uri = self.process_redirect(exc)
-                        if isinstance(exc_or_uri, Exception):
-                            # Response isn't a valid redirect; raise the exception.
-                            if exc_or_uri is exc:
-                                raise
+        with open_generation_scope(self, max_redirects=MAX_REDIRECTS) as generation:
+            try:
+                with (
+                    trio.CancelScope()
+                    if self.open_timeout is None
+                    else trio.fail_after(self.open_timeout)
+                ):
+                    for _ in range(generation.max_redirects):
+                        try:
+                            connection = await self.open_connection(nursery, generation)
+                        except Exception as exc:
+                            exc_or_uri = self.process_redirect(exc)
+                            if isinstance(exc_or_uri, Exception):
+                                # Response isn't a valid redirect;
+                                # raise the exception.
+                                if exc_or_uri is exc:
+                                    raise
+                                else:
+                                    raise exc_or_uri from exc
                             else:
-                                raise exc_or_uri from exc
+                                # Response is a valid redirect; follow it on
+                                # the current generation's URI cursor.
+                                continue
+
                         else:
-                            # Response is a valid redirect; follow it.
-                            self.uri = exc_or_uri
-                            self.ws_uri = parse_uri(exc_or_uri)
-                            continue
-
+                            connection.start_keepalive()
+                            return connection
                     else:
-                        connection.start_keepalive()
-                        return connection
-                else:
-                    raise SecurityError(f"more than {MAX_REDIRECTS} redirects")
+                        raise SecurityError(
+                            f"more than {generation.max_redirects} redirects"
+                        )
 
-        except trio.TooSlowError as exc:
-            # Re-raise exception with an informative error message.
-            raise TimeoutError("timed out during opening handshake") from exc
+            except trio.TooSlowError as exc:
+                # Re-raise exception with an informative error message.
+                raise TimeoutError("timed out during opening handshake") from exc
 
     # Do not define __await__ for ... = await nursery.start(connect, ...)
     # because it doesn't look idiomatic in Trio.
@@ -601,43 +577,41 @@ class connect:
     # async for ... in connect(...):
 
     async def __aiter__(self) -> AsyncIterator[ClientConnection]:
-        delays: Generator[float] | None = None
-        while True:
-            try:
-                async with self as connection:
-                    yield connection
-            except Exception as exc:
-                # Determine whether the exception is retryable or fatal.
-                # The API of process_exception is "return an exception or None";
-                # "raise an exception" is also supported because it's a frequent
-                # mistake. It isn't documented in order to keep the API simple.
+        # The loop generation owns the redirect cursor and backoff state for
+        # the lifetime of this iterator; nested one-shot opens get child
+        # generations that pop without touching these ledgers.
+        with loop_generation_scope(self, max_redirects=MAX_REDIRECTS) as generation:
+            while True:
                 try:
-                    new_exc = self.process_exception(exc)
-                except Exception as raised_exc:
-                    new_exc = raised_exc
+                    async with self as connection:
+                        yield connection
+                except Exception as exc:
+                    # Determine whether the exception is retryable or fatal.
+                    # The API of process_exception is "return an exception or None";
+                    # "raise an exception" is also supported because it's a frequent
+                    # mistake. It isn't documented in order to keep the API simple.
+                    new_exc = generation.classify_exception(exc)
 
-                # The connection failed with a fatal error.
-                # Raise the exception and exit the loop.
-                if new_exc is exc:
-                    raise
-                if new_exc is not None:
-                    raise new_exc from exc
+                    # The connection failed with a fatal error.
+                    # Raise the exception and exit the loop.
+                    if new_exc is exc:
+                        raise
+                    if new_exc is not None:
+                        raise new_exc from exc
 
-                # The connection failed with a retryable error.
-                # Start or continue backoff and reconnect.
-                if delays is None:
-                    delays = self.reconnect_delays()
-                delay = next(delays)
-                self.logger.info(
-                    "connect failed; reconnecting in %.1f seconds: %s",
-                    delay,
-                    traceback.format_exception_only(exc)[0].strip(),
-                )
-                await trio.sleep(delay)
+                    # The connection failed with a retryable error.
+                    # Start or continue backoff on this generation's cursor.
+                    delay = generation.next_delay()
+                    self.logger.info(
+                        "connect failed; reconnecting in %.1f seconds: %s",
+                        delay,
+                        traceback.format_exception_only(exc)[0].strip(),
+                    )
+                    generation = await trio_reconnect_wait(self, generation, delay)
 
-            else:
-                # The connection succeeded. Reset backoff.
-                delays = None
+                else:
+                    # The connection succeeded. Reset backoff.
+                    generation.reset_backoff()
 
 
 def unix_connect(

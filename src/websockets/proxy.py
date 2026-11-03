@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import urllib.parse
 import urllib.request
+from typing import Literal
 
 from .datastructures import Headers
 from .exceptions import InvalidProxy
@@ -11,7 +12,7 @@ from .http11 import USER_AGENT
 from .uri import WebSocketURI
 
 
-__all__ = ["get_proxy", "parse_proxy", "Proxy"]
+__all__ = ["get_proxy", "parse_proxy", "resolve_proxy", "Proxy"]
 
 
 @dataclasses.dataclass
@@ -92,6 +93,32 @@ def parse_proxy(proxy: str) -> Proxy:
         host = host.encode("idna").decode()
 
     return Proxy(scheme, host, port, username, password)
+
+
+def resolve_proxy(
+    proxy: str | Literal[True] | None,
+    ws_uri: WebSocketURI,
+    *,
+    unix: bool = False,
+) -> str | None:
+    """
+    Resolve the proxy to use for one opening attempt.
+
+    A connection established over a Unix socket is never proxied, regardless
+    of the configured setting. Otherwise, :obj:`True` selects the proxy
+    advertised by the environment for the (possibly redirected) destination
+    ``ws_uri``.
+
+    Resolving the proxy on every attempt keeps the direct TCP, HTTP CONNECT /
+    SOCKS, and Unix open paths symmetric with respect to the redirect cursor
+    of the current attempt generation.
+
+    """
+    if unix:
+        return None
+    if proxy is True:
+        return get_proxy(ws_uri)
+    return proxy
 
 
 def get_proxy(uri: WebSocketURI) -> str | None:

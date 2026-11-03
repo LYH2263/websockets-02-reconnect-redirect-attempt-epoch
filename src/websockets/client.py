@@ -357,6 +357,35 @@ class ClientConnection(ClientProtocol):
         super().__init__(*args, **kwargs)
 
 
+# Status codes that an opening handshake follows as redirects within a single
+# attempt generation. This table is deliberately distinct from
+# RETRYABLE_STATUS_CODES: a redirect rewrites the URI cursor of the ongoing
+# open, whereas a transient status drives the reconnect backoff cursor.
+REDIRECT_STATUS_CODES = frozenset(
+    {
+        300,  # Multiple Choices
+        301,  # Moved Permanently
+        302,  # Found
+        303,  # See Other
+        307,  # Temporary Redirect
+        308,  # Permanent Redirect
+    }
+)
+
+# Status codes considered transient by process_exception().
+RETRYABLE_STATUS_CODES = frozenset(
+    {
+        500,  # Internal Server Error
+        502,  # Bad Gateway
+        503,  # Service Unavailable
+        504,  # Gateway Timeout
+    }
+)
+
+# Credential headers stripped when following a cross-origin redirect.
+STRIPPED_REDIRECT_HEADERS = ("authorization", "cookie", "proxy-authorization")
+
+
 def process_exception(exc: Exception) -> Exception | None:
     """
     Determine whether a connection error is retryable or fatal.
@@ -372,8 +401,9 @@ def process_exception(exc: Exception) -> Exception | None:
     * :exc:`OSError` and :exc:`asyncio.TimeoutError`: network errors;
     * :exc:`~websockets.exceptions.InvalidMessage` when it stems from an
       :exc:`EOFError`: also network errors;
-    * :exc:`~websockets.exceptions.InvalidStatus` when the status code is 500,
-      502, 503, or 504: server or proxy errors.
+    * :exc:`~websockets.exceptions.InvalidStatus` when the status code is in
+      :data:`RETRYABLE_STATUS_CODES` (500, 502, 503, or 504): server or proxy
+      errors.
 
     All other exceptions are considered fatal.
 
@@ -381,6 +411,11 @@ def process_exception(exc: Exception) -> Exception | None:
     :func:`~websockets.asyncio.client.connect` (:mod:`asyncio`),
     :func:`~websockets.trio.client.connect` (:mod:`trio`), or
     :func:`~websockets.sync.client.reconnect` (:mod:`threading`).
+
+    When an :class:`~websockets.reconnect_redirect_attempt_epoch.AttemptEpoch`
+    is in use, the retry/fatal judgment is bound to the generation that
+    requested it; a judgment made by a superseded generation never opens a
+    connection on the new ledger.
 
     Return :obj:`None` if the exception is retryable i.e. when the error could
     be transient and trying to reconnect with the same parameters could succeed.
@@ -396,12 +431,9 @@ def process_exception(exc: Exception) -> Exception | None:
         return None
     if isinstance(exc, InvalidMessage) and isinstance(exc.__cause__, EOFError):
         return None
-    if isinstance(exc, InvalidStatus) and exc.response.status_code in [
-        500,  # Internal Server Error
-        502,  # Bad Gateway
-        503,  # Service Unavailable
-        504,  # Gateway Timeout
-    ]:
+    if isinstance(exc, InvalidStatus) and (
+        exc.response.status_code in RETRYABLE_STATUS_CODES
+    ):
         return None
     return exc
 

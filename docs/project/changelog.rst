@@ -25,6 +25,30 @@ fixing regressions shortly after a release.
 Only documented APIs are public. Undocumented, private APIs may change without
 notice.
 
+.. _17.5:
+
+17.5
+----
+
+*Unreleased*
+
+New features
+............
+
+* Added :class:`~websockets.reconnect_redirect_attempt_epoch.AttemptEpoch`
+  for binding the redirect-following budget of an opening handshake and the
+  reconnect backoff cursor of a retry loop to *attempt generations* on client
+  connections. A generation can be declared, advanced, and popped; once it is
+  superseded, its pending redirect URI rewrite, its unfinished backoff delay,
+  and its exception judgment stop driving new opens. A one-shot connect nested
+  inside a foreign reconnect loop — in :mod:`asyncio`, :mod:`trio`, or
+  :mod:`threading` — pushes its own child generation and pops it on exit,
+  including on exception, without touching the outer ledger. The
+  ``open_timeout``, ``reconnect_delays``, and ``close_timeout`` budgets remain
+  independent. Pass ``attempt_epoch`` to :func:`~asyncio.client.connect`,
+  :func:`~trio.client.connect`, :func:`~sync.client.connect`, or
+  :class:`~sync.client.reconnect`; without it, behavior is unchanged.
+
 .. _17.4:
 
 17.4
